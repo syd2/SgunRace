@@ -1,67 +1,70 @@
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 using UnityEngine.Splines;
 using Unity.Mathematics;
 
-public class SplineFromWaypoints : MonoBehaviour
+public class SplineFromWaypointsStrict : MonoBehaviour
 {
     [Header("Inputs")]
-    public Transform waypointsParent;     // RoadSpace/CenterMarkers
-    public SplineContainer outputSpline;  // Track (SplineContainer)
-    public Transform startWaypoint;       // Start/finish marker
-    public bool closed = true;
+    public Transform waypointsParent;          // RoadSpace/CenterMarkers
+    public SplineContainer outputSpline;       // Track (SplineContainer)
+    public bool closed = true;                 // loop lap or not
 
-    [Header("Ordering guardrails")]
-    [Tooltip("Max allowed link length (m). Set ~2–3x your typical spacing.")]
-    public float maxLinkDistance = 35f;
-    [Range(0f,1f)] public float directionBias = 0.7f; // prefer forward motion
-    [Tooltip("2-opt passes to uncross edges (0 disables).")]
-    [Range(0,6)] public int twoOptPasses = 2;
+    [Header("Safety")]
+    [Tooltip("Hard limit per segment; prevents cross-map jumps.")]
+    public float maxSegmentLength = 40f;       // meters
+    public bool abortOnLongEdge = true;
 
     [Header("Smoothing")]
-    [Range(0f, 1f)] public float handleTightness = 0.5f; // lower = rounder
+    [Range(0f,1f)] public float handleTightness = 0.5f; // lower = rounder
 
-    [Header("Projection (optional)")]
-    public LayerMask roadMask = ~0;
+    [Header("Project to road (optional)")]
+    public bool projectToRoad = true;
+    public LayerMask roadMask = ~0;            // set to your Road layer if you use one
     public float projectRayHeight = 50f;
-    public float projectYOffset = 0.00f;
+    public float projectYOffset = 0f;
 
-    [ContextMenu("Build Spline From Waypoints")]
-    public void Build()
+    [ContextMenu("Build (Strict Order)")]
+    public void BuildStrict()
     {
         if (!waypointsParent || !outputSpline) return;
 
-        // collect points
+        // 1) collect children IN HIERARCHY ORDER
         var pts = new List<Transform>();
         for (int i = 0; i < waypointsParent.childCount; i++)
-            pts.Add(waypointsParent.GetChild(i));
-        if (pts.Count < 2) { Debug.LogWarning("Need at least 2 waypoints."); return; }
+        {
+            var t = waypointsParent.GetChild(i);
+            if (t && t.gameObject.activeInHierarchy) pts.Add(t);
+        }
+        if (pts.Count < 2) { Debug.LogWarning("[StrictSpline] Need at least 2 waypoints."); return; }
 
-        // order: guarded nearest chain
-        var ordered = GuardedNearestChain(pts, out bool hadLongEdges);
+        // 2) safety: check segment lengths (including last->first if closed)
+        int limit = closed ? pts.Count : pts.Count - 1;
+        for (int i = 0; i < limit; i++)
+        {
+            Vector3 a = pts[i].position;
+            Vector3 b = pts[(i + 1) % pts.Count].position;
+            float d = Vector3.Distance(a, b);
+            if (d > maxSegmentLength)
+            {
+                Debug.LogWarning($"[StrictSpline] Segment {i}->{(i + 1) % pts.Count} is {d:F1} m > max {maxSegmentLength}. " +
+                                 $"Move/add a waypoint between them (or raise maxSegmentLength).");
+                if (abortOnLongEdge) return;
+            }
+        }
 
-        // optional 2-opt to uncross
-        if (closed && twoOptPasses > 0)
-            TwoOptRefine(ordered, twoOptPasses);
-
-        // warn if any egregious jump remains
-        if (HasLongEdge(ordered, maxLinkDistance * 1.01f))
-            Debug.LogWarning("[SplineFromWaypoints] Long edge remains. Add a marker in that area or raise maxLinkDistance slightly.");
-
-        // write spline
+        // 3) write knots at EXACT waypoint positions
         var s = outputSpline.Splines.Count > 0 ? outputSpline.Splines[0] : outputSpline.Spline;
         s.Clear();
-
-        foreach (var t in ordered)
+        foreach (var t in pts)
         {
-            Vector3 local = outputSpline.transform.InverseTransformPoint(t.position);
+            var local = outputSpline.transform.InverseTransformPoint(t.position);
             var knot = new BezierKnot((float3)local);
             s.Add(knot, TangentMode.Mirrored);
         }
         s.Closed = closed;
 
-        // mirrored handles
+        // 4) mirror handles for smoothness (knots stay put)
         int n = s.Count;
         for (int i = 0; i < n; i++)
         {
@@ -88,116 +91,14 @@ public class SplineFromWaypoints : MonoBehaviour
             s.SetKnot(i, knot);
         }
 
-        MarkSplineDirty();
-        Debug.Log($"[SplineFromWaypoints] Built spline with {n} knots.");
-    }
+        if (projectToRoad) ProjectKnotsToRoad();
 
-    // --- Ordering helpers ---
-
-    List<Transform> GuardedNearestChain(List<Transform> pts, out bool hadLongEdge)
-    {
-        hadLongEdge = false;
-        var remaining = new HashSet<Transform>(pts);
-
-        Transform start = startWaypoint && remaining.Contains(startWaypoint)
-            ? startWaypoint
-            : pts.OrderBy(t => t.position.z).First(); // fallback
-
-        var ordered = new List<Transform>(pts.Count);
-        Transform cur = start;
-        remaining.Remove(cur);
-        ordered.Add(cur);
-
-        Vector3 fwd = Vector3.forward;
-        if (remaining.Count > 0)
-            fwd = (Nearest(cur, remaining).position - cur.position).normalized;
-
-        while (remaining.Count > 0)
-        {
-            Transform next = null;
-            float bestScore = float.NegativeInfinity;
-
-            foreach (var c in remaining)
-            {
-                Vector3 d = c.position - cur.position;
-                float dist = d.magnitude;
-                if (dist > maxLinkDistance) continue;           // hard guard
-
-                float dirScore = Vector3.Dot(fwd, d.normalized); // prefer forward
-                float nearScore = 1f - Mathf.Clamp01(dist / maxLinkDistance);
-                float score = Mathf.Lerp(nearScore, dirScore, directionBias);
-                if (score > bestScore) { bestScore = score; next = c; }
-            }
-
-            if (next == null)
-            {
-                // nothing valid; fall back to nearest (and mark that we broke the guard)
-                next = Nearest(cur, remaining);
-                hadLongEdge = true;
-            }
-
-            ordered.Add(next);
-            remaining.Remove(next);
-            fwd = (next.position - cur.position).normalized;
-            cur = next;
-        }
-
-        return ordered;
-    }
-
-    void TwoOptRefine(List<Transform> order, int passes)
-    {
-        if (order.Count < 4) return;
-        for (int pass = 0; pass < passes; pass++)
-        {
-            bool improved = false;
-            int n = order.Count;
-            for (int i = 0; i < n - 1; i++)
-            {
-                int i2 = (i + 1) % n;
-                for (int j = i + 2; j < n - (closed ? 0 : 1); j++)
-                {
-                    int j2 = (j + 1) % n;
-                    float dOld = Dist(order[i], order[i2]) + Dist(order[j], order[j2]);
-                    float dNew = Dist(order[i], order[j])  + Dist(order[i2], order[j2]);
-                    if (dNew + 0.001f < dOld) // swap!
-                    {
-                        Reverse(order, i2, j);
-                        improved = true;
-                    }
-                }
-            }
-            if (!improved) break;
-        }
-    }
-
-    bool HasLongEdge(List<Transform> order, float limit)
-    {
-        int n = order.Count;
-        for (int i = 0; i < n; i++)
-        {
-            float d = Vector3.Distance(order[i].position, order[(i+1)%n].position);
-            if (d > limit) return true;
-        }
-        return false;
-    }
-
-    Transform Nearest(Transform a, IEnumerable<Transform> set)
-    {
-        Transform best = null; float bestD = float.PositiveInfinity;
-        foreach (var t in set) { float d = (t.position - a.position).sqrMagnitude; if (d < bestD) { bestD = d; best = t; } }
-        return best;
-    }
-
-    float Dist(Transform a, Transform b) => Vector3.Distance(a.position, b.position);
-
-    void Reverse(List<Transform> list, int i, int j)
-    {
-        while (i < j) { (list[i], list[j]) = (list[j], list[i]); i++; j--; }
+        MarkDirty();
+        Debug.Log($"[StrictSpline] Built {(closed ? "closed" : "open")} spline with {n} knots (strict order).");
     }
 
     [ContextMenu("Project Knots To Road")]
-    public void ProjectKnots()
+    public void ProjectKnotsToRoad()
     {
         if (!outputSpline) return;
         var s = outputSpline.Splines.Count > 0 ? outputSpline.Splines[0] : outputSpline.Spline;
@@ -209,22 +110,39 @@ public class SplineFromWaypoints : MonoBehaviour
             Vector3 wp = outputSpline.transform.TransformPoint((Vector3)k.Position);
             Vector3 start = wp + Vector3.up * projectRayHeight;
 
-            if (Physics.Raycast(start, Vector3.down, out var hit, projectRayHeight * 2f, roadMask, QueryTriggerInteraction.Ignore))
+            if (Physics.Raycast(start, Vector3.down, out var hit, projectRayHeight * 2f, roadMask,
+                                QueryTriggerInteraction.Ignore))
             {
                 Vector3 newWp = hit.point + Vector3.up * projectYOffset;
                 k.Position = (float3)outputSpline.transform.InverseTransformPoint(newWp);
                 s.SetKnot(i, k);
             }
         }
-        MarkSplineDirty();
-        Debug.Log("[SplineFromWaypoints] Projected knots to road.");
+        MarkDirty();
+        Debug.Log("[StrictSpline] Projected knots to road.");
     }
 
-    void MarkSplineDirty()
+    void MarkDirty()
     {
     #if UNITY_EDITOR
         UnityEditor.EditorUtility.SetDirty(outputSpline);
         UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(outputSpline.gameObject.scene);
     #endif
+    }
+
+    // Optional: draw long edges in red in the Scene view for easy fix
+    void OnDrawGizmos()
+    {
+        if (!waypointsParent) return;
+        Gizmos.color = Color.red;
+        for (int i = 0; i < waypointsParent.childCount - (closed ? 0 : 1); i++)
+        {
+            var a = waypointsParent.GetChild(i);
+            var b = waypointsParent.GetChild((i + 1) % waypointsParent.childCount);
+            if (!a || !b) continue;
+            float d = Vector3.Distance(a.position, b.position);
+            if (d > maxSegmentLength)
+                Gizmos.DrawLine(a.position, b.position);
+        }
     }
 }
