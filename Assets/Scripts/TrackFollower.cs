@@ -1,30 +1,34 @@
 using UnityEngine;
-using UnityEngine.Events;
 using UnityEngine.Splines;
 using Unity.Mathematics;
 
 /// Kinematic follower that moves along a SplineContainer at uniform m/s,
 /// with optional lateral lane offset supplied by LaneMover.
-[ExecuteAlways]
+[DefaultExecutionOrder(10)]
 public class TrackFollower : MonoBehaviour
 {
     [Header("Track")]
     public SplineContainer splineContainer;
-    [Tooltip("If true, wraps when reaching the end of the spline.")]
+    [Tooltip("If true, wraps when reaching the end.")]
     public bool loop = false;
+    [Tooltip("If true (and loop=false), stop at the end instead of clamping & jittering.")]
+    public bool stopAtEnd = true;
     [Tooltip("Meters per second along the centerline.")]
-    public float forwardSpeed = 1.2f;
+    public float forwardSpeed = 12f;
     [Tooltip("Lift above ground to avoid z-fighting.")]
     public float heightOffset = 0.20f;
 
-    [Header("Finish Behaviour (point-to-point)")]
-    [Tooltip("If true and loop is false, zero speed when finish is reached.")]
-    public bool stopAtEnd = true;
-    public UnityEvent onFinished;
-
     [Header("Sampling")]
-    [Tooltip("Higher = smoother speed. 128 is fine for short blockouts.")]
-    public int samples = 128;
+    [Tooltip("Higher = smoother speed. 256–512 recommended on real tracks.")]
+    public int samples = 256;
+
+    [Header("Lifecycle")]
+    [Tooltip("Reset distanceAlongTrack when entering Play mode.")]
+    public bool resetOnPlay = true;
+    [Tooltip("Starting distance (meters from start) when Play begins.")]
+    public float startDistance = 0f;
+    [Tooltip("If true, drives the object in Edit Mode for preview. Otherwise only while playing.")]
+    public bool previewInEditMode = false;
 
     [Header("Runtime (read-only)")]
     public float distanceAlongTrack = 0f;   // meters from start
@@ -37,47 +41,57 @@ public class TrackFollower : MonoBehaviour
     private float[] cumLen;   // cumulative length at each sample
     private float[] ts;       // t parameter [0..1] at each sample
 
-    // internal finish flag
-    private bool _finished;
-
     void OnEnable()
     {
         laneMover = GetComponent<LaneMover>();
         BuildLUT();
-        distanceAlongTrack = 0f;
-        _finished = false;
-        SnapRotationToTangent(0f);
+
+        if (Application.isPlaying && resetOnPlay)
+            distanceAlongTrack = Mathf.Clamp(startDistance, 0f, Mathf.Max(0.0001f, trackLength));
+
+        // initial orientation
+        if (splineContainer) SnapRotationToTangent(0f);
     }
 
     void OnValidate()
     {
-        if (samples < 16) samples = 16;
-        // Rebuild when values change in editor
+        samples = Mathf.Max(16, samples);
         BuildLUT();
+        // In edit mode, keep pose in sync when preview is enabled
+        if (!Application.isPlaying && previewInEditMode)
+            Drive(0f); // 0 dt -> just place according to current distance
     }
 
     void Update()
     {
+        if (!Application.isPlaying && !previewInEditMode) return;
         if (splineContainer == null || trackLength <= 0f) return;
 
-        // Advance distance uniformly in meters (unless we finished and must stop)
-        if (!(_finished && stopAtEnd))
-            distanceAlongTrack += forwardSpeed * Time.deltaTime;
+        float dt = Mathf.Max(0f, Time.deltaTime);
+        Drive(dt);
+    }
+
+    // --- Core driving ---
+    void Drive(float dt)
+    {
+        // advance
+        if (dt > 0f)
+            distanceAlongTrack += forwardSpeed * dt;
 
         if (loop)
         {
-            distanceAlongTrack %= trackLength;
-            if (distanceAlongTrack < 0f) distanceAlongTrack += trackLength;
+            if (trackLength > 0f)
+            {
+                distanceAlongTrack %= trackLength;
+                if (distanceAlongTrack < 0f) distanceAlongTrack += trackLength;
+            }
         }
         else
         {
-            // Detect finish once
-            if (!_finished && distanceAlongTrack >= trackLength)
+            if (stopAtEnd && distanceAlongTrack >= trackLength)
             {
-                distanceAlongTrack = trackLength;   // clamp to end
-                _finished = true;
-                if (stopAtEnd) forwardSpeed = 0f;  // halt our "engine"
-                onFinished?.Invoke();              // notify listeners (timer/UI/etc.)
+                distanceAlongTrack = trackLength;
+                // don't keep adding; effectively stopped
             }
             else
             {
@@ -93,7 +107,7 @@ public class TrackFollower : MonoBehaviour
         SplineUtility.Evaluate(spline, t, out float3 pL, out float3 tanL, out float3 upL);
 
         Vector3 worldPos = splineContainer.transform.TransformPoint((Vector3)pL);
-        Vector3 worldTan = splineContainer.transform.TransformDirection((Vector3)tanL).normalized;
+        Vector3 worldTan = splineContainer.transform.TransformDirection(((Vector3)tanL)).normalized;
 
         // Compute right vector in world space
         Vector3 right = Vector3.Cross(Vector3.up, worldTan).normalized;
@@ -108,49 +122,29 @@ public class TrackFollower : MonoBehaviour
         transform.rotation = Quaternion.LookRotation(worldTan, Vector3.up);
     }
 
-    // --- Public helpers -------------------------------------------------------
-
-    /// Rebuild the length lookup table (call if you edit the spline at runtime).
-    public void RebuildLUT() => BuildLUT();
-
-    /// Reset the follower to the start of the spline.
-    public void ResetToStart()
-    {
-        _finished = false;
-        distanceAlongTrack = 0f;
-        SnapRotationToTangent(0f);
-    }
-
-    /// Teleport along the track to a fraction (0..1) of its length.
-    public void TeleportToFraction(float f01)
-    {
-        f01 = Mathf.Clamp01(f01);
-        distanceAlongTrack = trackLength * f01;
-        _finished = false;
-        SnapRotationToTangent(DistanceToT(distanceAlongTrack));
-    }
-
-    // --- Internals ------------------------------------------------------------
-
+    // --- Helpers ---
     private Spline GetSpline()
     {
         // Supports Splines 2.x and 1.x
-        return splineContainer.Splines.Count > 0 ? splineContainer.Splines[0] : splineContainer.Spline;
+        return (splineContainer.Splines != null && splineContainer.Splines.Count > 0)
+            ? splineContainer.Splines[0]
+            : splineContainer.Spline;
     }
 
     private void BuildLUT()
     {
         if (splineContainer == null) return;
-
         var spline = GetSpline();
         if (spline == null) return;
+
+        // Compute total length (meters)
+        trackLength = SplineUtility.CalculateLength(spline, splineContainer.transform.localToWorldMatrix);
 
         // Allocate arrays
         int n = Mathf.Max(2, samples);
         cumLen = new float[n];
         ts     = new float[n];
 
-        // Sample positions in world space and accumulate length
         Vector3 prev = Vector3.zero;
         for (int i = 0; i < n; i++)
         {
@@ -165,17 +159,16 @@ public class TrackFollower : MonoBehaviour
 
             prev = wp;
         }
+        trackLength = cumLen[n - 1]; // measured length
 
-        // Guard: if spline changed drastically, clamp distance
-        distanceAlongTrack = Mathf.Clamp(distanceAlongTrack, 0f, cumLen[n - 1]);
-        trackLength = cumLen[n - 1]; // measured length (matches our LUT)
+        // keep distance valid
+        distanceAlongTrack = Mathf.Clamp(distanceAlongTrack, 0f, trackLength);
     }
 
     private float DistanceToT(float distance)
     {
         if (cumLen == null || cumLen.Length < 2) return 0f;
 
-        // Binary search for segment
         int lo = 0, hi = cumLen.Length - 1;
         distance = Mathf.Clamp(distance, 0f, cumLen[hi]);
 
@@ -204,8 +197,23 @@ public class TrackFollower : MonoBehaviour
     {
         var spline = GetSpline();
         if (spline == null) return;
-        SplineUtility.Evaluate(spline, t, out float3 pL, out float3 tanL, out float3 _upL);
-        Vector3 worldTan = splineContainer.transform.TransformDirection((Vector3)tanL).normalized;
+        SplineUtility.Evaluate(spline, t, out float3 _pL, out float3 tanL, out float3 _upL);
+        Vector3 worldTan = splineContainer.transform.TransformDirection(((Vector3)tanL)).normalized;
         transform.rotation = Quaternion.LookRotation(worldTan, Vector3.up);
+    }
+
+    // Handy inspector buttons
+    [ContextMenu("Snap To Start")]
+    void SnapToStart()
+    {
+        distanceAlongTrack = 0f;
+        if (!Application.isPlaying) Drive(0f);
+    }
+
+    [ContextMenu("Snap To End")]
+    void SnapToEnd()
+    {
+        distanceAlongTrack = trackLength;
+        if (!Application.isPlaying) Drive(0f);
     }
 }

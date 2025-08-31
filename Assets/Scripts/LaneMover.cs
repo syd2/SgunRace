@@ -1,101 +1,154 @@
+using System.Collections;
 using UnityEngine;
-#if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
-#endif
 
-/// Smoothly animates lateral lane offset for the TrackFollower.
-/// Index: 0=left, 1=center, 2=right  →  offsets: -L, 0, +L.
-[ExecuteAlways]
+[DisallowMultipleComponent]
 public class LaneMover : MonoBehaviour
 {
-    [Header("Lanes")]
-    [Range(0,2)] public int startLaneIndex = 1;
-    public float laneOffset = 1.25f;      // L
-    [Tooltip("Seconds to complete a lane change.")]
-    public float laneSwapTime = 0.3f;
+    // ----- Lane layout -----
+    [Header("Lane Layout")]
+    [Tooltip("Number of lanes across the road (odd recommended so there is a center lane).")]
+    public int laneCount = 3;
+    [Tooltip("Distance in meters between lane centers.")]
+    public float laneWidth = 1.8f;
 
-    [Header("Input (optional)")]
-    public bool enableInput = true;
+    // ----- Swap behaviour -----
+    [Header("Swap")]
+    [Tooltip("Seconds to tween between lanes.")]
+    public float laneSwapTime = 0.18f;
+    [Tooltip("Allow one extra queued step while swapping (e.g., double-tap).")]
+    public bool bufferNext = true;
 
-    // Runtime
-    public int LaneIndex { get; private set; }
-    public float CurrentOffset { get; private set; }  // read by TrackFollower
+    // ----- Input -----
+    [Header("Input (uses your existing 'move' action)")]
+    [Tooltip("Reference to the Vector2 'move' action (WASD/arrows). X drives left/right swaps.")]
+    public InputActionReference move;  // Vector2
 
-    private float targetOffset;
-    private float t; // 0..1 progress of current swap
-    private float lastSwapDir; // -1 or +1 for easing
+    [Header("Input Hysteresis")]
+    [Tooltip("Press threshold on |X| to register a left/right press.")]
+    [Range(0.05f, 0.95f)] public float pressThreshold = 0.5f;
+    [Tooltip("Release threshold to re-arm after the stick/key returns toward center.")]
+    [Range(0.0f, 0.95f)] public float releaseThreshold = 0.25f;
+
+    // ----- Exposed to TrackFollower -----
+    public float CurrentOffset { get; private set; } = 0f;
+    public int LaneIndex => _laneIndex;
+
+    // runtime
+    int _laneIndex;
+    int _targetIndex;
+    bool _isSwapping;
+    int _bufferedDelta;   // -1/0/+1
+
+    // latches to generate one event per press
+    bool _leftLatched;
+    bool _rightLatched;
 
     void OnEnable()
     {
-        SetLane(startLaneIndex, instant:true);
+        _laneIndex = _targetIndex = CenterIndex();
+        UpdateOffsetImmediate();
+
+        if (move && move.action != null && !move.action.enabled)
+            move.action.Enable();
+    }
+
+    void OnDisable()
+    {
+        if (move && move.action != null && move.action.enabled)
+            move.action.Disable();
     }
 
     void Update()
     {
-        if (enableInput && Application.isPlaying)
+        // Read X from your move (Vector2)
+        if (move == null || move.action == null) return;
+
+        Vector2 v = move.action.ReadValue<Vector2>();
+        float x = v.x;
+
+        // Latch logic (one swap per press)
+        // Go Right
+        if (x > pressThreshold && !_rightLatched)
         {
-            bool leftPressed = false, rightPressed = false;
-
-            // --- New Input System ---
-            #if ENABLE_INPUT_SYSTEM
-            var kb = Keyboard.current;
-            if (kb != null)
-            {
-                leftPressed  = kb.aKey.wasPressedThisFrame || kb.leftArrowKey.wasPressedThisFrame;
-                rightPressed = kb.dKey.wasPressedThisFrame || kb.rightArrowKey.wasPressedThisFrame;
-            }
-            #endif
-
-            // --- Old Input Manager (works if Active Input Handling = Both) ---
-            #if ENABLE_LEGACY_INPUT_MANAGER
-            leftPressed  |= Input.GetKeyDown(KeyCode.A) || Input.GetKeyDown(KeyCode.LeftArrow);
-            rightPressed |= Input.GetKeyDown(KeyCode.D) || Input.GetKeyDown(KeyCode.RightArrow);
-            #endif
-
-            if (leftPressed)  SetLane(LaneIndex - 1);
-            if (rightPressed) SetLane(LaneIndex + 1);
+            _rightLatched = true;
+            _leftLatched  = false;
+            HandleInput(+1);
+        }
+        else if (x < releaseThreshold) // allow re-arming when it returns near center
+        {
+            _rightLatched = false;
         }
 
-        // Animate toward target
-        if (!Mathf.Approximately(CurrentOffset, targetOffset))
+        // Go Left
+        if (x < -pressThreshold && !_leftLatched)
         {
-            if (laneSwapTime <= 0f)
-            {
-                CurrentOffset = targetOffset;
-            }
-            else
-            {
-                float dir = Mathf.Sign(targetOffset - CurrentOffset);
-                if (dir != 0f && dir != lastSwapDir) { t = 0f; lastSwapDir = dir; }
-
-                t += Time.deltaTime / Mathf.Max(1e-4f, laneSwapTime);
-                float s = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(t));
-                CurrentOffset = Mathf.Lerp(CurrentOffset, targetOffset, s);
-
-                if (t >= 1f || Mathf.Abs(CurrentOffset - targetOffset) < 1e-3f)
-                {
-                    CurrentOffset = targetOffset; t = 0f;
-                }
-            }
+            _leftLatched = true;
+            _rightLatched = false;
+            HandleInput(-1);
+        }
+        else if (x > -releaseThreshold)
+        {
+            _leftLatched = false;
         }
     }
 
-    public void SetLane(int newIndex, bool instant = false)
+    void HandleInput(int delta)
     {
-        newIndex = Mathf.Clamp(newIndex, 0, 2);
-        LaneIndex = newIndex;
-        targetOffset = IndexToOffset(LaneIndex);
-        if (instant) { CurrentOffset = targetOffset; t = 0f; }
-    }
+        int min = 0;
+        int max = Mathf.Max(0, laneCount - 1);
 
-    private float IndexToOffset(int idx)
-    {
-        switch (idx)
+        if (!_isSwapping)
         {
-            case 0: return -laneOffset;
-            case 1: return 0f;
-            case 2: return +laneOffset;
-            default: return 0f;
+            _bufferedDelta = 0;
+            _targetIndex = Mathf.Clamp(_laneIndex + delta, min, max);
+            if (_targetIndex != _laneIndex)
+                StartCoroutine(SwapRoutine(_laneIndex, _targetIndex));
+        }
+        else if (bufferNext)
+        {
+            // record one extra step to apply after current swap
+            _bufferedDelta = Mathf.Clamp(_bufferedDelta + delta, -1, +1);
         }
     }
+
+    IEnumerator SwapRoutine(int from, int to)
+    {
+        _isSwapping = true;
+
+        float t = 0f;
+        float fromOff = LaneCenter(from);
+        float toOff   = LaneCenter(to);
+
+        while (t < laneSwapTime)
+        {
+            t += Time.deltaTime;
+            float u = Mathf.Clamp01(t / laneSwapTime);
+            // smoothstep ease
+            u = u * u * (3f - 2f * u);
+            CurrentOffset = Mathf.Lerp(fromOff, toOff, u);
+            yield return null;
+        }
+
+        _laneIndex = to;
+        CurrentOffset = LaneCenter(_laneIndex);
+        _isSwapping = false;
+
+        // apply one buffered step if any
+        if (_bufferedDelta != 0)
+        {
+            int min = 0;
+            int max = Mathf.Max(0, laneCount - 1);
+            int nextTarget = Mathf.Clamp(_laneIndex + _bufferedDelta, min, max);
+            _bufferedDelta = 0;
+            if (nextTarget != _laneIndex)
+                StartCoroutine(SwapRoutine(_laneIndex, nextTarget));
+        }
+    }
+
+    int CenterIndex() => (laneCount - 1) / 2;
+
+    float LaneCenter(int idx) => (idx - CenterIndex()) * laneWidth;
+
+    void UpdateOffsetImmediate() => CurrentOffset = LaneCenter(_laneIndex);
 }
